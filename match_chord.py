@@ -6,7 +6,7 @@ df.drop_duplicates(subset=["Chord", "Finger Label", "Guitar String", "Fret"], in
 df.dropna(subset=["Finger Label"], inplace=True)
 df["Fret"] = df["Fret"].replace("x", 0)
 df["Fret"] = df["Fret"].astype(int)
-print(df)
+# print(df)
 
 CHORDS = {}
 
