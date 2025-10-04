@@ -8,11 +8,13 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List, Dict
 import json
 
-from playsound import playsound
+# from playsound import playsound
 import threading
 
-def play_success_sound():
-    threading.Thread(target=playsound, args=('success.wav',), daemon=True).start()
+from match_chord import match_chord
+
+# def play_success_sound():
+#     threading.Thread(target=playsound, args=('success.wav',), daemon=True).start()
 
 # Initialize MediaPipe Hand solution
 mp_hands = mp.solutions.hands
@@ -415,7 +417,7 @@ def draw_fretboard(image, region: FretboardRegion, debug=False, chord=None, show
             label_y = int(left_point[1] + 5)
             cv2.putText(image, STRING_NAMES[i], (label_x, label_y),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        for fret in range(1, NUM_FRETS + 1):
+        for fret in range(1, NUM_FRETS):
             t = fret / NUM_FRETS
             top = corners[0, 0] + t * (corners[1, 0] - corners[0, 0])
             bottom = corners[3, 0] + t * (corners[2, 0] - corners[3, 0])
@@ -570,9 +572,27 @@ def main():
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
 
+        # --- New Feature: Chord Confirmation ---
+        if tracker.current_positions:
+            # Extract finger positions
+            finger_positions = [(FINGER_NAMES.index(pos.finger_name) + 1, pos.string_num, pos.fret_num) for pos in tracker.current_positions]
+            print (finger_positions)
+            # Match the chord
+            matched_chord = match_chord(finger_positions)
+
+            # Provide feedback
+            if matched_chord:
+                cv2.putText(frame, f"Chord: {matched_chord}", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+            else:
+                cv2.putText(frame, "No matching chord", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+
+
         # --- Draw MediaPipe hand skeleton and purple fingertips ---
         if results.multi_hand_landmarks:
             for hand_landmarks in results.multi_hand_landmarks:
+                tracker.update_positions(hand_landmarks, w, h, manual_region)
                 mp_drawing.draw_landmarks(
                     frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
                     mp_drawing.DrawingSpec(color=(0,255,255), thickness=2, circle_radius=2),
