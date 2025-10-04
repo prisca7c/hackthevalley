@@ -32,6 +32,15 @@ audio_thread = threading.Thread(
 # def play_success_sound():
 #     threading.Thread(target=playsound, args=('success.wav',), daemon=True).start()
 
+def play_success_sound():
+    """Try to play a success sound if playsound is available, otherwise no-op."""
+    try:
+        from playsound import playsound
+        threading.Thread(target=playsound, args=('success.wav',), daemon=True).start()
+    except Exception:
+        # playsound not installed or file missing; silently ignore
+        return
+
 # Initialize MediaPipe Hand solution
 mp_hands = mp.solutions.hands
 hands = mp_hands.Hands(
@@ -101,83 +110,260 @@ class StabilizedTracker:
 
 class FretboardDetector:
     def __init__(self):
+        print("[FretboardDetector] __init__")
         self.tracking_enabled = False
         self.feature_detector = cv2.ORB_create(nfeatures=1000, scaleFactor=1.2)
         self.reference_features = None
         self.reference_keypoints = None
         self.reference_descriptors = None
         self.matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
-        self.corner_trackers = [StabilizedTracker(smoothing_factor=0.90) for _ in range(4)]
+        # make corner trackers smoother (higher smoothing -> less jitter)
+        self.corner_smoothing = 0.1
+        self.corner_trackers = [StabilizedTracker(smoothing_factor=self.corner_smoothing) for _ in range(4)]
         self.fret_trackers = []
         self.lost_track_frames = 0
-        self.max_lost_frames = 15
+        self.max_lost_frames = 8
         self.last_valid_region = None
+        # stability checks to avoid jitter: tuned for responsiveness
+        self.stability_count = 0
+        # require a couple of consecutive small-motion frames before accepting non-LK homographies
+        self.required_stable_frames = 2
+        # tighter per-frame motion threshold (px) to avoid jitter
+        self.stability_threshold_px = 16
+        # minimum homography inliers required (raise to be more robust)
+        self.min_inliers = 8
+        # lightweight debug timer to log match/inlier counts once per second
+        self._last_debug_time = 0
+        self.debug = False
+        # Lucas-Kanade optical flow fallback
+        self.use_lk = False
+        self.lk_prev_gray = None
+        self.lk_points = None
+        self.lk_src_pts = None
+        # LK params tuned for reasonably stable tracking
+        self.lk_params = dict(winSize=(15, 15), maxLevel=2,
+                              criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
     def set_reference_region(self, frame, region: FretboardRegion):
-        tl_x, tl_y = region.top_left
-        br_x, br_y = region.bottom_right
-        margin = 20
-        h, w = frame.shape[:2]
-        tl_x = max(0, tl_x - margin)
-        tl_y = max(0, tl_y - margin)
-        br_x = min(w, br_x + margin)
-        br_y = min(h, br_y + margin)
-        reference_patch = frame[tl_y:br_y, tl_x:br_x]
+        print("[FretboardDetector] set_reference_region called")
+# src_pts: your 4 detected fretboard corners
+        (x1, y1) = region.corners[0]
+        (x2, y2) = region.corners[1]
+        (x3, y3) = region.corners[2]
+        (x4, y4) = region.corners[3]
+
+        src_pts = np.float32([
+            [x1, y1], [x2, y2], [x3, y3], [x4, y4]
+        ])
+
+        # Choose desired rectified output size
+        width, height = 800, 200
+        dst_pts = np.float32([
+            [0, 0],
+            [width, 0],
+            [width, height],
+            [0, height]
+        ])
+
+        # Perspective transform
+        M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+
+        # Warp trapezoid -> rectangle
+        reference_patch = cv2.warpPerspective(frame, M, (width, height))
         if reference_patch.size == 0:
             return
         gray_patch = cv2.cvtColor(reference_patch, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced = clahe.apply(gray_patch)
         self.reference_keypoints, self.reference_descriptors = self.feature_detector.detectAndCompute(enhanced, None)
+        # handle case when ORB finds no keypoints (detectAndCompute may return None)
+        if self.reference_keypoints is None or len(self.reference_keypoints) == 0:
+            # fallback: don't fail — keep descriptors None and allow LK-only tracking
+            self.reference_keypoints = []
+            self.reference_descriptors = None
+
         self.reference_features = {
             'patch': reference_patch.copy(),
             'region': region,
-            'width': br_x - tl_x,
-            'height': br_y - tl_y,
-            'offset': (tl_x, tl_y)
+            'width': width,        # warped fretboard width
+            'height': height,      # warped fretboard height
+            'src_pts': src_pts,    # original 4 corner points
+            'dst_pts': dst_pts,    # rectified rectangle corners
+            'M': M,                # forward perspective transform
+            'M_inv': cv2.getPerspectiveTransform(dst_pts, src_pts),  # inverse transform
+            # offset for any relative coordinate calculations (x, y)
+            'offset': (region.top_left[0], region.top_left[1])
         }
+        
         self.tracking_enabled = True
-        corners = np.float32([
-            [region.top_left[0], region.top_left[1]],
-            [region.bottom_right[0], region.top_left[1]],
-            [region.bottom_right[0], region.bottom_right[1]],
-            [region.top_left[0], region.bottom_right[1]]
-        ])
+        # initialize corner trackers with the detected quadrilateral corners (for display smoothing)
+        try:
+            quad = np.float32([region.corners[0], region.corners[1], region.corners[2], region.corners[3]])
+        except Exception:
+            quad = np.float32([
+                [region.top_left[0], region.top_left[1]],
+                [region.bottom_right[0], region.top_left[1]],
+                [region.bottom_right[0], region.bottom_right[1]],
+                [region.top_left[0], region.bottom_right[1]]
+            ])
         for i, tracker in enumerate(self.corner_trackers):
-            tracker.update(corners[i])
+            tracker.update(quad[i])
         self.fret_trackers = []
         if region.fret_markers:
             for marker in region.fret_markers:
                 self.fret_trackers.append(StabilizedTracker(smoothing_factor=0.92))
         self.last_valid_region = region
-        print(f"✓ Tracking initialized with {len(self.reference_keypoints)} features")
+        # Dense LK initialization: detect good features to track inside the rectified reference patch
+        try:
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self.lk_prev_gray = gray
+            # detect good features on the rectified reference_patch (dst coordinate space)
+            ref_gray = gray_patch  # already the rectified gray patch
+            max_corners = 250
+            corners = cv2.goodFeaturesToTrack(ref_gray, maxCorners=max_corners, qualityLevel=0.01, minDistance=6)
+            if corners is not None and len(corners) >= 4:
+                # corners are in rectified patch coordinates (x,y). Transform to image coords using inverse map
+                # corners shape Nx1x2 float32
+                self.lk_src_pts = corners.astype(np.float32)
+                # transform to image coordinates using stored inverse transform
+                try:
+                    M_inv = self.reference_features.get('M_inv')
+                    if M_inv is not None:
+                        img_pts = cv2.perspectiveTransform(self.lk_src_pts, M_inv)
+                        self.lk_points = img_pts.astype(np.float32)
+                        self.use_lk = True
+                    else:
+                        self.lk_points = None
+                        self.use_lk = False
+                except Exception:
+                    self.lk_points = None
+                    self.use_lk = False
+            else:
+                self.lk_src_pts = None
+                self.lk_points = None
+                self.use_lk = False
+        except Exception:
+            self.lk_src_pts = None
+            self.lk_points = None
+            self.use_lk = False
+        kp_count = len(self.reference_keypoints) if self.reference_keypoints else 0
+        if kp_count == 0:
+            print("✓ Tracking initialized (0 ORB features) — LK mode: {}".format(self.use_lk))
+        else:
+            print(f"✓ Tracking initialized with {kp_count} features — LK mode: {self.use_lk}")
     def track_region(self, frame, last_region: FretboardRegion) -> Optional[FretboardRegion]:
-        if not self.tracking_enabled or self.reference_descriptors is None:
+        print("[FretboardDetector] track_region called (tracking_enabled=%s, has_reference=%s)" % (
+            str(self.tracking_enabled), str(self.reference_features is not None)
+        ))
+        # allow LK-only tracking: require reference_features initialized (which contains M and LK points)
+        if not self.tracking_enabled or self.reference_features is None:
+            print("[FretboardDetector] track_region: tracking disabled or no reference features")
             return last_region
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         enhanced_frame = clahe.apply(gray_frame)
         current_keypoints, current_descriptors = self.feature_detector.detectAndCompute(enhanced_frame, None)
-        if current_descriptors is None or len(current_keypoints) < 15:
-            self.lost_track_frames += 1
-            if self.lost_track_frames > self.max_lost_frames:
-                print("⚠ Tracking lost - not enough features")
-            return last_region
-        matches = self.matcher.knnMatch(self.reference_descriptors, current_descriptors, k=2)
-        good_matches = []
-        for match_pair in matches:
-            if len(match_pair) == 2:
-                m, n = match_pair
-                if m.distance < 0.8 * n.distance:
-                    good_matches.append(m)
-        if len(good_matches) < 8:
-            self.lost_track_frames += 1
-            return last_region
+        low_features = (current_descriptors is None or len(current_keypoints) < 15)
+
+        # do not return immediately on low features: try Lucas-Kanade before failing
         self.lost_track_frames = 0
-        src_pts = np.float32([self.reference_keypoints[m.queryIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        dst_pts = np.float32([current_keypoints[m.trainIdx].pt for m in good_matches]).reshape(-1, 1, 2)
-        M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 3.0)
+    # Try Lucas-Kanade optical flow first if initialized
+        if self.use_lk and self.lk_prev_gray is not None and self.lk_points is not None:
+            try:
+                next_pts, status, err = cv2.calcOpticalFlowPyrLK(self.lk_prev_gray, gray_frame, self.lk_points, None, **self.lk_params)
+                # require that most points are tracked successfully
+                if next_pts is not None and status is not None and status.sum() >= max(2, int(0.5 * len(self.lk_points))):
+                    tracked_pts = next_pts.reshape(-1, 2)
+                    dst_pts_rect = self.reference_features['dst_pts']
+                    # compute transform from rectified patch -> current frame using tracked points
+                    try:
+                        M_lk = cv2.getPerspectiveTransform(dst_pts_rect, tracked_pts.astype(np.float32))
+                        M = M_lk
+                        lk_used = True
+                        # update LK buffers
+                        self.lk_points = next_pts
+                        self.lk_prev_gray = gray_frame
+                        # continue with the rest of the pipeline using M
+                    except Exception:
+                        M = None
+                else:
+                    # LK insufficient - fall back to feature matching
+                    M = None
+            except Exception:
+                M = None
+        else:
+            M = None
+        # If LK didn't produce M, fall back to descriptor matching and compute homography from matches
         if M is None:
-            return last_region
+            # if descriptors are missing and LK failed, we can't proceed
+            if low_features:
+                self.lost_track_frames += 1
+                if self.lost_track_frames > self.max_lost_frames:
+                    print("⚠ Tracking lost - not enough features and LK failed")
+                return last_region
+            matches = self.matcher.knnMatch(self.reference_descriptors, current_descriptors, k=2)
+            good_matches = []
+            for match_pair in matches:
+                if len(match_pair) == 2:
+                    m, n = match_pair
+                    if m.distance < 0.8 * n.distance:
+                        good_matches.append(m)
+            # If a hand enters the frame, many matches can come from skin regions.
+            # Filter out matches whose current image locations fall on skin-colored pixels
+            try:
+                # only apply skin filtering when a significant fraction of matches fall on skin
+                ycrcb_img = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+                skin_filtered = []
+                skin_count = 0
+                for m in good_matches:
+                    kp = current_keypoints[m.trainIdx].pt
+                    xk, yk = int(kp[0]), int(kp[1])
+                    if xk < 0 or yk < 0 or yk >= ycrcb_img.shape[0] or xk >= ycrcb_img.shape[1]:
+                        continue
+                    cr = int(ycrcb_img[yk, xk, 1])
+                    cb = int(ycrcb_img[yk, xk, 2])
+                    # Typical skin thresholds in YCrCb
+                    if 133 <= cr <= 173 and 77 <= cb <= 127:
+                        # likely skin
+                        skin_count += 1
+                        continue
+                    skin_filtered.append(m)
+                if len(good_matches) > 0:
+                    frac_skin = skin_count / float(len(good_matches))
+                else:
+                    frac_skin = 0.0
+                # if a large fraction of matches are on skin, use the filtered set; otherwise keep original
+                if frac_skin > 0.35 and len(skin_filtered) >= self.min_inliers:
+                    good_matches = skin_filtered
+            except Exception:
+                # if any error, keep original good_matches
+                pass
+            if len(good_matches) < self.min_inliers:
+                self.lost_track_frames += 1
+                return last_region
+            src_pts = np.float32([self.reference_keypoints[m.queryIdx].pt for m in good_matches])
+            dst_pts = np.float32([current_keypoints[m.trainIdx].pt for m in good_matches])
+            # compute homography from matched points
+            if len(src_pts) >= 4 and len(dst_pts) >= 4:
+                M, mask = cv2.findHomography(src_pts.reshape(-1,1,2), dst_pts.reshape(-1,1,2), cv2.RANSAC, 5.0)
+            else:
+                M = None
+            if M is None:
+                return last_region
+            # require a minimum number of inliers to trust the homography
+            inliers = 0
+            try:
+                inliers = int(mask.sum()) if mask is not None else 0
+            except Exception:
+                try:
+                    inliers = int(np.sum(mask))
+                except Exception:
+                    inliers = 0
+            if inliers < self.min_inliers:
+                self.lost_track_frames += 1
+                return last_region
+            lk_used = False
+        else:
+            lk_used = True
         ref_width = self.reference_features['width']
         ref_height = self.reference_features['height']
         offset_x, offset_y = self.reference_features['offset']
@@ -188,6 +374,58 @@ class FretboardDetector:
             [0, ref_height]
         ]).reshape(-1, 1, 2)
         transformed_corners = cv2.perspectiveTransform(corners, M)
+        # sanity-check transformed corners against last valid region to avoid insane jumps
+        if self.last_valid_region is not None and hasattr(self.last_valid_region, 'quad_corners') and self.last_valid_region.quad_corners is not None:
+            prev = self.last_valid_region.quad_corners.reshape(-1, 2)
+            cur = transformed_corners.reshape(-1, 2)
+            # compute euclidean distances
+            dists = np.linalg.norm(cur - prev, axis=1)
+            # if any corner moves more than a very large threshold suddenly, reject this frame
+            large_jump_thresh = max(120, 0.25 * max(frame.shape[0], frame.shape[1]))
+            if np.any(dists > large_jump_thresh):
+                # unstable mapping - ignore
+                self.lost_track_frames += 1
+                return last_region
+            # If transform came from LK, accept it immediately for fluency
+            if lk_used:
+                stable_enough = True
+            else:
+                # check for small motion: accumulate stability count only if median corner motion is small
+                median_dist = float(np.median(dists))
+                if median_dist < self.stability_threshold_px:
+                    self.stability_count += 1
+                else:
+                    self.stability_count = 0
+                # require several consecutive small-motion frames before accepting
+                stable_enough = (self.stability_count >= self.required_stable_frames)
+                if not stable_enough:
+                    # accept quicker when homography is supported by many inliers and median motion is modest
+                    try:
+                        many_inliers = (inliers >= max(20, self.min_inliers * 3))
+                    except Exception:
+                        many_inliers = False
+                    if many_inliers and median_dist < max(self.stability_threshold_px * 2, 16):
+                        stable_enough = True
+            # optional debug overlay: draw previous and current corner positions
+        else:
+            # no previous region: treat as stable to initialize
+            stable_enough = True
+            dists = np.zeros((4,))
+        if self.debug:
+            try:
+                # draw previous quad (blue) and new transformed corners (red)
+                prev = self.last_valid_region.quad_corners.astype(np.int32)
+                for p in prev:
+                    cv2.circle(frame, tuple(p[0]), 3, (255, 0, 0), -1)
+                cur = transformed_corners.astype(np.int32)
+                for p in cur:
+                    cv2.circle(frame, tuple(p[0]), 4, (0, 0, 255), -1)
+            except Exception:
+                pass
+        else:
+            # no previous region: treat as stable to initialize
+            stable_enough = True
+            dists = np.zeros((4,))
         smoothed_corners = []
         for i, corner in enumerate(transformed_corners):
             smoothed = self.corner_trackers[i].update(corner[0])
@@ -219,6 +457,10 @@ class FretboardDetector:
                 new_y_top = int(transformed_fret[0, 0, 1])
                 new_y_bottom = int(transformed_fret[1, 0, 1])
                 new_markers.append((new_x, new_y_top, 2, new_y_bottom - new_y_top))
+        # If the mapping isn't stable yet, keep returning the last_region (avoids jitter)
+        if not stable_enough:
+            return last_region
+
         tracked_region = FretboardRegion(
             top_left=(int(smoothed_corners[0, 0, 0]), int(smoothed_corners[0, 0, 1])),
             bottom_right=(int(smoothed_corners[2, 0, 0]), int(smoothed_corners[2, 0, 1])),
@@ -226,6 +468,10 @@ class FretboardDetector:
             confidence=len(good_matches) / max(len(self.reference_keypoints), 1)
         )
         tracked_region.quad_corners = smoothed_corners
+        # update last valid region for future stability checks
+        self.last_valid_region = tracked_region
+        # reset stability count so subsequent small motions are re-evaluated
+        self.stability_count = 0
         return tracked_region
 
 class FingerTracker:
@@ -399,8 +645,8 @@ class ChordTutor:
                 cv2.circle(frame, (sx, diagram_y - 10), 6, (100, 255, 100), 2)
             else:
                 fy = diagram_y + (fret - 0.5) * fret_spacing
-                cv2.circle(frame, (int(sx), int(fy)), 10, (0, 255, 255), -1)
-                cv2.circle(frame, (int(sx), int(fy)), 10, (255, 255, 255), 2)
+                cv2.circle(frame, (int(sx), int(fy)), 6, (0, 255, 255), -1)
+                cv2.circle(frame, (int(sx), int(fy)), 6, (255, 255, 255), 2)
                 finger_num = chord_info['fingers'][string_idx]
                 if finger_num:
                     cv2.putText(frame, str(finger_num), (int(sx) - 5, int(fy) + 5),
@@ -457,8 +703,8 @@ def draw_fretboard(image, region: FretboardRegion, debug=False, chord=None, show
                     fret_t = fret / NUM_FRETS
                     sx = int(string_start[0] + (string_end[0] - string_start[0]) * fret_t)
                     sy = int(string_start[1] + (string_end[1] - string_start[1]) * fret_t)
-                    cv2.circle(image, (sx, sy), 14, (0, 255, 255), -1)
-                    cv2.circle(image, (sx, sy), 14, (255, 255, 255), 2)
+                    cv2.circle(image, (sx, sy), 8, (0, 255, 255), -1)
+                    cv2.circle(image, (sx, sy), 8, (255, 255, 255), 2)
                     if show_grid_fingers:
                         cv2.putText(image, str(finger_num), (sx - 7, sy + 7),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
@@ -539,8 +785,8 @@ def main():
     print("🎸 AI Guitar Tutor with Advanced Tracking")
     print("=" * 60)
     print("\nSetup:")
-    print("  1. Click top-left corner of fretboard")
-    print("  2. Click bottom-right corner of fretboard")
+    print("  Click the FOUR corners of the fretboard in order: top-left, top-right, bottom-right, bottom-left")
+    print("  (Right-click to undo the last point. Press 'r' to reset selection.)")
     print("  3. Practice the displayed chord!")
     print("\nControls:")
     print("  'd' - Toggle debug mode")
@@ -554,15 +800,45 @@ def main():
     print("  SPACE - Next chord after checkmark")
     print("  ESC - Exit")
     print("=" * 60 + "\n")
+
+    def order_points(pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0] = pts[np.argmin(s)]     # top-left
+        rect[2] = pts[np.argmax(s)]     # bottom-right
+
+        diff = np.diff(pts, axis=1)
+        rect[1] = pts[np.argmin(diff)]  # top-right
+        rect[3] = pts[np.argmax(diff)]  # bottom-left
+        return rect
+
     def mouse_callback(event, x, y, flags, param):
         nonlocal temp_coords, manual_region, manual_mode, current_frame
+        # debug: report clicks
+        if event == cv2.EVENT_LBUTTONDOWN:
+            print(f"[mouse_callback] LMB at {(x,y)} manual_mode={manual_mode} temp_len={len(temp_coords)}")
+        # If not in manual mode, allow a click to enter manual selection and start the first corner
+        if event == cv2.EVENT_LBUTTONDOWN and not manual_mode:
+            manual_mode = True
+            temp_coords = [(x, y)]
+            print(f"[mouse_callback] Entered manual selection; first corner {(x,y)}")
+            return
+        # Left-click: add a corner (when already in manual mode)
         if event == cv2.EVENT_LBUTTONDOWN and manual_mode:
-            temp_coords.append((x, y))
-            if len(temp_coords) == 2:
-                x1, y1 = temp_coords[0]
-                x2, y2 = temp_coords[1]
-                tl = (min(x1, x2), min(y1, y2))
-                br = (max(x1, x2), max(y1, y2))
+            if len(temp_coords) < 4:
+                temp_coords.append((x, y))
+            else:
+                # ignore extra clicks until reset
+                return
+            if len(temp_coords) == 4:
+                # interpret the four user clicks as the quad corners
+                pts = np.float32([temp_coords[0], temp_coords[1], temp_coords[2], temp_coords[3]])
+                pts_ordered = order_points(pts)
+
+                x_vals = [int(p[0]) for p in pts_ordered]
+                y_vals = [int(p[1]) for p in pts_ordered]
+                tl = (min(x_vals), min(y_vals))
+                br = (max(x_vals), max(y_vals))
                 fret_width = (br[0] - tl[0]) / NUM_FRETS
                 markers = [(int(tl[0] + i * fret_width), tl[1], 2, br[1] - tl[1])
                           for i in range(1, NUM_FRETS + 1)]
@@ -571,19 +847,46 @@ def main():
                     bottom_right=br,
                     fret_markers=markers
                 )
+                # store the ordered corner points on the region so set_reference_region can use them
+                try:
+                    manual_region.corners = pts_ordered.tolist()
+                except Exception:
+                    manual_region.corners = [tuple(pt) for pt in pts_ordered]
+                # also store quad_corners in same format used elsewhere
+                manual_region.quad_corners = pts_ordered.reshape(-1, 1, 2)
+
                 if current_frame is not None:
+                    print("[mouse_callback] calling set_reference_region immediately")
                     detector.set_reference_region(current_frame, manual_region)
+                else:
+                    # if user clicked before first frame available, queue it and main loop will apply
+                    print("[mouse_callback] queuing manual_region until frame available")
+                    queued_manual_region.append(manual_region)
                 manual_mode = False
                 temp_coords.clear()
                 print("✓ Fretboard tracking enabled")
+        # Right-click: undo last point
+        elif event == cv2.EVENT_RBUTTONDOWN and manual_mode:
+            if temp_coords:
+                temp_coords.pop()
     cv2.namedWindow('AI Guitar Tutor')
     cv2.setMouseCallback('AI Guitar Tutor', mouse_callback)
+    # queue in case mouse callback happens before we have a frame
+    queued_manual_region: List[FretboardRegion] = []
     while cap.isOpened():
         success, frame = cap.read()
         if not success:
             continue
         frame = cv2.flip(frame, 1)
         current_frame = frame.copy()
+        # if a manual region was queued (clicked before first frame), initialize detector now
+        if queued_manual_region:
+            try:
+                queued = queued_manual_region.pop(0)
+                print("[main] initializing detector from queued manual region")
+                detector.set_reference_region(current_frame, queued)
+            except Exception as e:
+                print("[main] queued set_reference_region failed:", e)
         h, w = frame.shape[:2]
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
@@ -598,10 +901,10 @@ def main():
 
             # Provide feedback
             if matched_chord:
-                cv2.putText(frame, f"Chord: {matched_chord}", (10, 50),
+                cv2.putText(frame, f"Chord: {matched_chord}", (10, 100),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
             else:
-                cv2.putText(frame, "No matching chord", (10, 50),
+                cv2.putText(frame, "No matching chord", (10, 100),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
 
 
@@ -628,16 +931,23 @@ def main():
 
         active_region = manual_region
         if not manual_mode and manual_region is not None:
+            detector.debug = debug_mode
             tracked_region = detector.track_region(frame, manual_region)
             if tracked_region:
                 manual_region = tracked_region
                 active_region = tracked_region
         if manual_mode:
-            cv2.putText(frame, "Click fretboard corners (top-left, then bottom-right)",
-                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            for pt in temp_coords:
-                cv2.circle(frame, pt, 5, (0, 0, 255), -1)
+            cv2.putText(frame, "Click FOUR corners (TL, TR, BR, BL). Right-click to undo.",
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            for i, pt in enumerate(temp_coords):
+                cv2.circle(frame, pt, 6, (0, 0, 255), -1)
+                cv2.putText(frame, str(i+1), (pt[0] + 8, pt[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
         if active_region:
+            # draw small status text about detector
+            ref_status = 'YES' if detector.reference_features is not None else 'NO'
+            det_status = 'ON' if detector.tracking_enabled else 'OFF'
+            cv2.putText(frame, f'Detector: {det_status} Ref: {ref_status}', (10, h-50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
             draw_fretboard(frame, active_region, debug_mode, chord=tutor.current_chord, show_grid_fingers=show_grid_fingers)
             if show_tracking_info and active_region.confidence > 0:
                 conf_text = f"Track: {active_region.confidence:.1%}"
