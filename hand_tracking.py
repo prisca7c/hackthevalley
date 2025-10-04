@@ -13,6 +13,22 @@ import threading
 
 from match_chord import match_chord
 
+
+# FOR THE CHORD DETECTION
+import chord_detect 
+def chord_detected():
+    print("Chord event triggered!")
+    chord_detect.stop_listening()
+
+# Run audio in background thread
+audio_thread = threading.Thread(
+    target=chord_detect.start_listening, 
+    kwargs={"device_index": 1, "on_chord_detected": chord_detected},
+    daemon=True
+)
+
+
+
 # def play_success_sound():
 #     threading.Thread(target=playsound, args=('success.wav',), daemon=True).start()
 
@@ -494,7 +510,7 @@ def save_positions(positions: List[FingerPosition], filename="guitar_positions.t
                        f"Fret {pos.fret_num}\n")
 
 def main():
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(1)
     if not cap.isOpened():
         print("Error: Could not open camera")
         return
@@ -667,6 +683,7 @@ def main():
 
                 # --- Chord completion logic ---
                 if accuracy_result['is_perfect'] and not chord_completed:
+                    audio_thread.start()
                     play_success_sound()
                     chord_completed = True
                     checkmark_time = time.time()
@@ -759,6 +776,7 @@ def main():
     cv2.destroyAllWindows()
     hands.close()
     print("\n✓ AI Guitar Tutor closed")
+
 
 if __name__ == "__main__":
     main()
